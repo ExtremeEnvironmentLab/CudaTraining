@@ -1,0 +1,34 @@
+Temperature Statistics:
+Number of data points: 1000
+Mean temperature: 0.837846
+Standard deviation: 0.161453
+Minimum temperature: 0.460839
+Maximum temperature: 1.016230
+Temperature range: 0.555391
+
+Segment Statistics:
+
+Segment 1 (Steps 0-199):
+  Mean temperature: 0.552449
+  Standard deviation: 0.069222
+  Min-Max range: 0.460839 - 0.996162
+
+Segment 2 (Steps 200-399):
+  Mean temperature: 0.790681
+  Standard deviation: 0.030090
+  Min-Max range: 0.549854 - 0.983444
+
+Segment 3 (Steps 400-599):
+  Mean temperature: 0.902365
+  Standard deviation: 0.017511
+  Min-Max range: 0.782570 - 0.994267
+
+Segment 4 (Steps 600-799):
+  Mean temperature: 0.963895
+  Standard deviation: 0.016556
+  Min-Max range: 0.908889 - 0.995268
+
+Segment 5 (Steps 800-999):
+  Mean temperature: 0.979841
+  Standard deviation: 0.012942
+  Min-Max range: 0.952330 - 1.016230

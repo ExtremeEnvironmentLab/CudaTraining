@@ -7,6 +7,8 @@
    每10次更新都需要重新计算，所以效率很低。
    下一步就是优化它。
 
+   现在起码能用了，可以叫它V-0.1版本
+
    如需执行，请在终端输入如下两行命令：
    nvcc -arch=sm_61 ConsoleApplicationMD3_CUDA.cu -o ConsoleApplicationMD3_CUDA
    ./ConsoleApplicationMD3_CUDA

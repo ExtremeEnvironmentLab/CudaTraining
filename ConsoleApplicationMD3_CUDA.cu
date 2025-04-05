@@ -1,22 +1,39 @@
 /*
-   使用Verlet和动态近邻表方法计算液态氩的分子动力学 - CUDA加速版本
-   这个版本用的是笨办法：在设备端和host端反复拷贝粒子的信息，没有用CUDA的共享内存
-   或者流式显存分配，效率并不是很高。
-   
-   实际上最需要通过CUDA并行化的就是更新近邻表，因为它的时间复杂度最高，
-   每10次更新都需要重新计算，所以效率很低。
-   下一步就是优化它。
+   ConsoleApplicationMD3_CUDA.cu
 
-   现在起码能用了，可以叫它V-0.1版本
+   使用Verlet和动态近邻表方法计算液态氩的分子动力学 - CUDA加速版本
+
+   主循环当中包含每个物理帧进行一次的Verlet和每10个物理帧进行一次近邻表更新
+   Verlet的时间复杂度是O(N)，近邻表更新的时间复杂度是O(N²)，在CUDA化以后是O(1)，所以效率很高，但对应地空间复杂度增加了
+
+   在主物理循环中跑的核心代码包括：
+   ├──Verlet
+   │   ├──Verlet前半步CUDA核函数
+   │   ├──计算表内粒子对之间的距离
+   │   │    └──表内距离CUDA核函数
+   │   ├──置零加速度CUDA核函数
+   │   ├──更新加速度CUDA核函数
+   │   └──Verlet后半步CUDA核函数
+   └──更新近邻表
+        └──判别是否要加入近邻表的CUDA核函数
+   
 
    如需执行，请在终端输入如下两行命令：
-   nvcc -arch=sm_61 ConsoleApplicationMD3_CUDA.cu -o ConsoleApplicationMD3_CUDA
-   ./ConsoleApplicationMD3_CUDA
+   nvcc -arch=sm_61 ConsoleApplicationMD3_CUDA.cu -o MD3_CUDA
+   ./MD3_CUDA.exe
    其中-arch=sm_61是GPU架构，这里对应的是1050显卡，可自行修改
 
-   难受的是，我现在还没搞明白为什么VS内置的CUDA编译选项要求文件中不能出现中文注释，
-   所以说暂时不能直接一键编译。
- */
+   调试运行命令
+   nvcc -arch=sm_61 ConsoleApplicationMD3_CUDA.cu -g -G -o MD3_CUDA
+    cuda-memcheck ./MD3_CUDA.exe
+*/
+
+//   现在我对它挺满意的，不过其实还有一个很好的算法是基于空间网格划分的并行计算，以后可以试试
+//   难受的是，我现在还没搞明白为什么VS内置的CUDA编译选项要求文件中不能出现中文注释，所以说暂时不能直接一键编译。
+
+
+
+
 
 #include <cmath>
 #include <cstdlib>
@@ -34,10 +51,10 @@ double rho = 0.8;         // 密度
 double T = 1.0;           // 温度
 double L;                 // 仿真空间的边长（通过N和RHO计算）
 
-// 主机端数据
+// 主机端粒子数据
 double** h_r, ** h_v, ** h_a;     // 位置，速度，加速度（主机端）
 
-// 设备端数据
+// 设备端粒子数据
 double *d_r, *d_v, *d_a;          // 位置，速度，加速度（设备端）
 
 // 用于实现动态近邻表的各种参数
@@ -45,11 +62,14 @@ double rCutOff = 2.5;     // 力计算的截断距离
 double rMax = 3.3;        // 近邻表内粒子对最大距离
 int nPairs;               // 当前近邻表粒子对数量
 int** h_pairList;         // 近邻表（主机端）
+int* h_pairListMax;       // 最大近邻表（主机端）
 double** h_drPair;        // 每个对的朝向 (i,j)（主机端）
 double* h_rSqdPair;       // 每个对的距离(i,j)（主机端）
 
 // 设备端近邻表数据
+int* d_nPairs;			  // 当前近邻表粒子对数量（设备端）
 int* d_pairList;          // 近邻表（设备端）
+int* d_pairListMax;       // 最大近邻表（设备端）
 double* d_drPair;         // 每个对的朝向 (i,j)（设备端）
 double* d_rSqdPair;       // 每个对的距离(i,j)（设备端）
 
@@ -70,13 +90,11 @@ void initPositions();
 void initVelocities();
 void rescaleVelocities();
 double instantaneousTemperature();
-void computeSeparation(int, int, double[], double&);
-void updatePairList();
-void updatePairSeparations();
 void allocateMemory();
 void freeMemory();
 void copyDataToDevice();
 void copyDataFromDevice();
+
 
 // 声明CUDA核函数
 __global__ void computeAccelerationsKernel(double* d_r, double* d_a, int* d_pairList, 
@@ -85,8 +103,7 @@ __global__ void computeAccelerationsKernel(double* d_r, double* d_a, int* d_pair
 __global__ void velocityVerletStep1Kernel(double* d_r, double* d_v, double* d_a, 
                                          double dt, double L, int N);
 __global__ void velocityVerletStep2Kernel(double* d_v, double* d_a, double dt, int N);
-
-// 初始化，这里是整个程序的第一步
+// 物理循环开始前的位置、速度初始化
 void initialize() {
     allocateMemory();
     initPositions();
@@ -105,22 +122,32 @@ void allocateMemory() {
         h_a[i] = new double[3];
     }
 
-    // 设备内存分配
+    // 设备粒子内存分配
     CUDA_CHECK_ERROR(cudaMalloc((void**)&d_r, N * 3 * sizeof(double)));
     CUDA_CHECK_ERROR(cudaMalloc((void**)&d_v, N * 3 * sizeof(double)));
     CUDA_CHECK_ERROR(cudaMalloc((void**)&d_a, N * 3 * sizeof(double)));
 
-    // 近邻表内存分配
-    int maxPairs = N * (N - 1) / 2;
-    h_pairList = new int* [maxPairs];
-    h_drPair = new double* [maxPairs];
-    for (int p = 0; p < maxPairs; p++) {
-        h_pairList[p] = new int[2];
-        h_drPair[p] = new double[3];
-    }
-    h_rSqdPair = new double[maxPairs];
+    // 设备端近邻表内存分配
+    int nPairsMax = N * (N - 1) / 2;
+    h_pairListMax = new int[nPairsMax * 2]; // 添加主机端内存分配
+    CUDA_CHECK_ERROR(cudaMalloc((void**)&d_pairList, nPairsMax * 2 * sizeof(int)));
+    CUDA_CHECK_ERROR(cudaMalloc((void**)&d_pairListMax, nPairsMax * 2 * sizeof(int)));
+    CUDA_CHECK_ERROR(cudaMalloc((void**)&d_drPair, nPairsMax * 3 * sizeof(double)));
+    CUDA_CHECK_ERROR(cudaMalloc((void**)&d_rSqdPair, nPairsMax * sizeof(double)));
+    CUDA_CHECK_ERROR(cudaMalloc((void**)&d_nPairs, sizeof(int)));
 
-    // 设备端近邻表内存分配 - 将在updatePairList后根据实际nPairs分配
+    //填充最大近邻表
+    int pairIdx = 0;
+    for (int p1 = 0; p1 < N; p1++) {
+        for (int p2 = p1 + 1; p2 < N; p2++) {
+            h_pairListMax[pairIdx * 2] = p1;
+            h_pairListMax[pairIdx * 2 + 1] = p2;
+            pairIdx++;
+        }
+    }
+
+    //将最大近邻表复制到设备端
+	CUDA_CHECK_ERROR(cudaMemcpy(d_pairListMax, h_pairListMax, nPairsMax * 2 * sizeof(int), cudaMemcpyHostToDevice));
 }
 
 // 释放内存
@@ -135,25 +162,20 @@ void freeMemory() {
     delete[] h_v;
     delete[] h_a;
 
-    int maxPairs = N * (N - 1) / 2;
-    for (int p = 0; p < maxPairs; p++) {
-        delete[] h_pairList[p];
-        delete[] h_drPair[p];
-    }
-    delete[] h_pairList;
-    delete[] h_drPair;
-    delete[] h_rSqdPair;
+    delete[] h_pairListMax; // 这个是在主机端分配了的，需要释放
 
     // 释放设备内存
-    cudaFree(d_r);
-    cudaFree(d_v);
-    cudaFree(d_a);
-    cudaFree(d_pairList);
-    cudaFree(d_drPair);
-    cudaFree(d_rSqdPair);
+    if (d_r) cudaFree(d_r);
+    if (d_v) cudaFree(d_v);
+    if (d_a) cudaFree(d_a);
+    if (d_pairList) cudaFree(d_pairList);
+    if (d_pairListMax) cudaFree(d_pairListMax); // 添加释放
+    if (d_drPair) cudaFree(d_drPair);
+    if (d_rSqdPair) cudaFree(d_rSqdPair);
+    if (d_nPairs) cudaFree(d_nPairs);       // 添加释放
 }
 
-// 将数据从主机复制到设备
+// 将粒子数据从主机复制到设备
 void copyDataToDevice() {
     // 将位置、速度和加速度数据各自转换为一维数组，形式为：粒子1号的rx,ry,rz，粒子2号的rx,ry,rz，...
     double* h_r_flat = new double[N * 3];
@@ -178,7 +200,7 @@ void copyDataToDevice() {
     delete[] h_a_flat;
 }
 
-// 将数据从设备复制回主机
+// 将粒子数据从设备复制回主机
 void copyDataFromDevice() {
     // 分配临时一维数组
     double* h_r_flat = new double[N * 3];
@@ -204,115 +226,166 @@ void copyDataFromDevice() {
     delete[] h_a_flat;
 }
 
-// 距离计算
-void computeSeparation(int i, int j, double dr[], double& rSqd) {
+// CUDA核函数：表内粒子距离更新
+__global__ void computeSeparationKernal(double* d_r, int* d_pairList,
+                                        double* d_drPair, double* d_rSqdPair,
+                                        int* d_nPairs, double L) {
+    // 计算当前线程的粒子对编号
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= d_nPairs[0]) {
+		return;
+	}
+
+    // 获取两个粒子编号
+	int p1 = d_pairList[2 * i];
+	int p2 = d_pairList[2 * i + 1];
+
     // 计算周期边界条件下的距离
-    rSqd = 0;
-    for (int d = 0; d < 3; d++) {
-        dr[d] = h_r[i][d] - h_r[j][d]; // 距离
-        if (dr[d] >= 0.5 * L)
-            dr[d] -= L;
-        if (dr[d] < -0.5 * L)
-            dr[d] += L;
-        rSqd += dr[d] * dr[d]; // 距离的平方
+    d_rSqdPair[i] = 0;
+    for (int d = 0; d < 3; d++) {// 遍历三个维度
+		d_drPair[i * 3 + d] = d_r[p1 * 3 + d] - d_r[p2 * 3 + d]; // 距离
+
+        //应用周期边界条件
+        if (d_drPair[i * 3 + d] >= 0.5 * L)
+            d_drPair[i * 3 + d] -= L;
+        if (d_drPair[i * 3 + d] < -0.5 * L)
+            d_drPair[i * 3 + d] += L;
+
+        d_rSqdPair[i] += d_drPair[i * 3 + d] * d_drPair[i * 3 + d]; // 距离的平方
     }
 }
 
-// 更新近邻表
-// 这实际上是本程序唯一一个计算时间需求以N²规律剧烈增长的部分
-// TODO：将其放入CUDA当中计算
-void updatePairList() {
-    nPairs = 0;
-    double dr[3];
-
-    // 在最大的粒子对列表当中进行遍历，寻找其中处于有效距离内的粒子对
-    for (int i = 0; i < N - 1; i++)
-        for (int j = i + 1; j < N; j++) {
-            double rSqd;
-            computeSeparation(i, j, dr, rSqd);
-            if (rSqd < rMax * rMax) {
-                h_pairList[nPairs][0] = i;
-                h_pairList[nPairs][1] = j;
-                ++nPairs;
-            }
-        }
-
-    // 为设备端近邻表分配内存
-    if (d_pairList != nullptr) cudaFree(d_pairList);
-    if (d_drPair != nullptr) cudaFree(d_drPair);
-    if (d_rSqdPair != nullptr) cudaFree(d_rSqdPair);
-
-    CUDA_CHECK_ERROR(cudaMalloc((void**)&d_pairList, nPairs * 2 * sizeof(int)));
-    CUDA_CHECK_ERROR(cudaMalloc((void**)&d_drPair, nPairs * 3 * sizeof(double)));
-    CUDA_CHECK_ERROR(cudaMalloc((void**)&d_rSqdPair, nPairs * sizeof(double)));
-
-    // 将近邻表数据转换为一维数组
-    int* h_pairList_flat = new int[nPairs * 2];
-    for (int p = 0; p < nPairs; p++) {
-        h_pairList_flat[p * 2] = h_pairList[p][0];
-        h_pairList_flat[p * 2 + 1] = h_pairList[p][1];
-    }
-
-    // 复制近邻表到设备
-    CUDA_CHECK_ERROR(cudaMemcpy(d_pairList, h_pairList_flat, nPairs * 2 * sizeof(int), cudaMemcpyHostToDevice));
-    
-    delete[] h_pairList_flat;
-}
-
-// 更新近邻表内粒子的距离
+// 主机端调用核函数更新近邻表内粒子的距离
 void updatePairSeparations() {
-    double dr[3];
-    for (int p = 0; p < nPairs; p++) {
-        int i = h_pairList[p][0];
-        int j = h_pairList[p][1];
-        double rSqd;
-        computeSeparation(i, j, dr, rSqd);
-        for (int d = 0; d < 3; d++)
-            h_drPair[p][d] = dr[d];
-        h_rSqdPair[p] = rSqd;
+        //使用computeSeparationKernal核函数计算表内粒子对之间的距离
+    // 从设备获取当前近邻表数量
+    CUDA_CHECK_ERROR(cudaMemcpy(&nPairs, d_nPairs, sizeof(int), cudaMemcpyDeviceToHost));
+    
+    if(nPairs > 0) {
+        int blockSize = 256;
+        int numBlocks = (nPairs + blockSize - 1) / blockSize;
+        computeSeparationKernal<<<numBlocks, blockSize>>>(d_r, d_pairList,
+            d_drPair, d_rSqdPair,
+            d_nPairs, L);
+        CUDA_CHECK_ERROR(cudaGetLastError());
     }
+    CUDA_CHECK_ERROR(cudaDeviceSynchronize());
+}
 
-    // 将更新后的距离数据转换为一维数组
-    double* h_drPair_flat = new double[nPairs * 3];
-    for (int p = 0; p < nPairs; p++) {
-        for (int d = 0; d < 3; d++) {
-            h_drPair_flat[p * 3 + d] = h_drPair[p][d];
+// CUDA核函数：根据粒子对距离判定是否放入近邻表
+__global__ void separationJudgeKernal(double* d_r, int* d_pairList, int* d_pairListMax,
+                                 double* d_drPair, double* d_rSqdPair,
+                                 int* d_nPairs, double rMax,  int nPairsMax, double L)
+{
+	// 计算当前线程的粒子对编号
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i >= nPairsMax) {
+        return;
         }
+
+	// 最大的粒子对列表d_pairListMax是一个上三角矩阵
+    // 如果N=3那么矩阵是这个样子：
+    // [0 1 ，0 2]
+    // [ -  ，1 2]，其中左下角没有元素，总元素数为N*(N-1)/2
+    // 在主程序初始化阶段已经用简单的双循环创建固定的d_pairListMax
+	// 下面根据d_pairListMax获取两个粒子的编号
+    int p1 = d_pairListMax[2 * i];
+    int p2 = d_pairListMax[2 * i + 1];
+
+    //先全部计算一遍距离，也就是让第i个线程计算第i组粒子对的距离
+    d_rSqdPair[i] = 0;
+    for (int d = 0; d < 3; d++) {// 遍历三个维度
+        // 从绝对位置计算相对位置
+        d_drPair[i * 3 + d] = d_r[p1 * 3 + d] - d_r[p2 * 3 + d];
+
+        //应用周期边界条件调整相对位置取值
+        if (d_drPair[i * 3 + d] >= 0.5 * L)
+            d_drPair[i * 3 + d] -= L;
+        if (d_drPair[i * 3 + d] < -0.5 * L)
+            d_drPair[i * 3 + d] += L;
+
+        // 勾股定律计算距离的平方
+        d_rSqdPair[i] += d_drPair[i * 3 + d] * d_drPair[i * 3 + d]; 
     }
 
-    // 复制到设备
-    CUDA_CHECK_ERROR(cudaMemcpy(d_drPair, h_drPair_flat, nPairs * 3 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK_ERROR(cudaMemcpy(d_rSqdPair, h_rSqdPair, nPairs * sizeof(double), cudaMemcpyHostToDevice));
+	// 再判别距离,决定是否加入到近邻表原子加法
+	if (d_rSqdPair[i] < rMax * rMax) {
+        int idx = atomicAdd(d_nPairs, 1);
+        d_pairList[idx * 2] = d_pairListMax[i * 2];
+        d_pairList[idx * 2 + 1] = d_pairListMax[i * 2 + 1];
+	}
+}
 
-    delete[] h_drPair_flat;
+// 主机端调用核函数更新近邻表
+// 这实际上是本程序唯一一个计算需求以N²规律剧烈增长的部分
+void updatePairList() {
+    // 将当前近邻表粒子对数量初始化为0
+    cudaMemset(d_nPairs, 0, sizeof(int));
+
+    int nPairsMax = (N * (N - 1)) / 2; // 最大粒子对数
+    // 先在最大近邻表上算全部N*（N-1）/2对距离，后判别距离，然后增长近邻表，对d_nPairs进行原子加法
+	separationJudgeKernal << <(nPairsMax + 255) / 256, 256 >> > ( d_r, d_pairList, d_pairListMax,
+                                                                  d_drPair, d_rSqdPair,
+                                                                  d_nPairs, rMax, nPairsMax, L);
+    CUDA_CHECK_ERROR(cudaGetLastError());
+    CUDA_CHECK_ERROR(cudaDeviceSynchronize());
+
+    // 将d_nPairs从设备复制回主机
+    CUDA_CHECK_ERROR(cudaMemcpy(&nPairs, d_nPairs, sizeof(int), cudaMemcpyDeviceToHost));
+
+}
+
+// CUDA核函数：置零加速度
+__global__ void zeroAccelerationsKernel(double* d_a, int N) {
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+
+	if (idx < N) {
+		d_a[idx * 3] = 0.0;
+		d_a[idx * 3 + 1] = 0.0;
+		d_a[idx * 3 + 2] = 0.0;
+	}
 }
 
 // CUDA核函数：计算加速度
 __global__ void computeAccelerationsKernel(double* d_r, double* d_a, int* d_pairList, 
                                           double* d_drPair, double* d_rSqdPair, 
-                                          int nPairs, double rCutOff, int N) {
+                                          int nPairs, double rCutOff, int N) 
+{
+    // 每个线程计算自己的索引
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    
-    // 初始化加速度为0
-    if (idx < N) {
-        d_a[idx * 3] = 0.0;
-        d_a[idx * 3 + 1] = 0.0;
-        d_a[idx * 3 + 2] = 0.0;
-    }
-    __syncthreads();
 
     // 计算粒子对之间的力
-    if (idx < nPairs) {
+    if (idx < nPairs) {// 每个线程处理一个粒子对
         int i = d_pairList[idx * 2];
         int j = d_pairList[idx * 2 + 1];
         double rSqd = d_rSqdPair[idx];
 
+        // --- 开始添加检查 ---
+        // 添加一个小的阈值来防止距离过近导致的计算问题
+        double epsilon = 1e-9; 
+        if (rSqd < epsilon) {
+            // 如果距离平方小于阈值，可以选择跳过这对粒子的力计算
+            // 或者打印一个警告（但注意内核printf可能影响性能）
+            // printf("Warning: Particle pair %d-%d too close (rSqd=%.6e), skipping force calculation.\\n", i, j, rSqd);
+            return; // 直接返回，不计算这对的力贡献
+        }
+        // --- 结束添加检查 ---
+
+
         if (rSqd < rCutOff * rCutOff) {
+
+            // 计算力
             double r2Inv = 1.0 / rSqd;
             double r6Inv = r2Inv * r2Inv * r2Inv;
             double f = 24.0 * r2Inv * r6Inv * (2.0 * r6Inv - 1.0);
 
-            // 使用原子操作更新加速度（使用CAS循环实现double类型的原子加法）
+            // 使用原子操作更新加速度（使用CAS循环实现double类型的原子加法，SM61不支持直接使用double类型原子加法）
+            // 注意: Compute Capability 6.1 (sm_61) *确实* 支持 double 类型的 atomicAdd。
+            // 可以简化为:
+            // double force_component_i = f * d_drPair[idx * 3 + d];
+            // atomicAdd(&d_a[i * 3 + d], force_component_i);
+            // atomicAdd(&d_a[j * 3 + d], -force_component_i);
+            // 但暂时保留原有的 CAS 实现，以防万一
             for (int d = 0; d < 3; d++) {
                 double force = f * d_drPair[idx * 3 + d];
                 // 对粒子i的加速度进行原子加法
@@ -373,9 +446,9 @@ __global__ void velocityVerletStep2Kernel(double* d_v, double* d_a, double dt, i
     }
 }
 
-// 使用CUDA加速的Verlet积分
+// 使用CUDA加速的Verlet
 void velocityVerlet(double dt) {
-    // 设置CUDA线程块和网格大小
+    // 根据需要设置CUDA线程块和网格大小
     int blockSize = 256;
     int numBlocks = (N + blockSize - 1) / blockSize;
     int numBlocksPairs = (nPairs + blockSize - 1) / blockSize;
@@ -385,9 +458,13 @@ void velocityVerlet(double dt) {
     CUDA_CHECK_ERROR(cudaGetLastError());
     CUDA_CHECK_ERROR(cudaDeviceSynchronize());
 
-    // 更新粒子对距离（需要从设备复制数据到主机）
-    copyDataFromDevice();
+    // 更新表内粒子对距离
     updatePairSeparations();
+
+    // 置零加速度
+    zeroAccelerationsKernel<<<numBlocks, blockSize>>>(d_a, N);
+    CUDA_CHECK_ERROR(cudaGetLastError());
+    CUDA_CHECK_ERROR(cudaDeviceSynchronize());
 
     // 计算新的加速度
     computeAccelerationsKernel<<<numBlocksPairs, blockSize>>>(d_r, d_a, d_pairList, d_drPair, d_rSqdPair, nPairs, rCutOff, N);
@@ -518,25 +595,79 @@ int main() {
     d_pairList = nullptr;
     d_drPair = nullptr;
     d_rSqdPair = nullptr;
+    d_nPairs = nullptr; // 确保 d_nPairs 也初始化为 nullptr
     
-    // 初始化模拟
+    // 在CPU完成速度与位置的初始化
     initialize();
     
     // 将数据复制到设备
     copyDataToDevice();
     
-    // 更新近邻表
-    updatePairList();
-    updatePairSeparations();
-    
-    // 设置CUDA线程块和网格大小
-    int blockSize = 256;
-    int numBlocksPairs = (nPairs + blockSize - 1) / blockSize;
-    
-    // 计算初始加速度
-    computeAccelerationsKernel<<<numBlocksPairs, blockSize>>>(d_r, d_a, d_pairList, d_drPair, d_rSqdPair, nPairs, rCutOff, N);
-    CUDA_CHECK_ERROR(cudaGetLastError());
-    CUDA_CHECK_ERROR(cudaDeviceSynchronize());
+    // 开始初始帧调试，在GPU完成近邻表与加速度的初始化
+    cout << "--- Debugging Initial Frame ---" << endl;
+
+    // 更新近邻表 (CUDA 版本)
+    cout << "Updating pair list (GPU)..." << endl;
+    updatePairList(); 
+    CUDA_CHECK_ERROR(cudaDeviceSynchronize()); // 确保内核执行完毕
+
+    // 检查 nPairs
+    CUDA_CHECK_ERROR(cudaMemcpy(&nPairs, d_nPairs, sizeof(int), cudaMemcpyDeviceToHost));
+    cout << "Initial nPairs after updatePairList: " << nPairs << endl;
+
+    if (nPairs <= 0) {
+        cout << "Warning: Initial nPairs is zero or negative. Skipping further initial checks." << endl;
+    } else {
+        // 更新粒子对距离 (CUDA 版本)
+        cout << "Updating pair separations (GPU)..." << endl;
+        updatePairSeparations();
+        CUDA_CHECK_ERROR(cudaDeviceSynchronize()); // 确保内核执行完毕
+
+        // 检查前几对的距离平方
+        int checkPairs = min(nPairs, 10); // 检查前10对或实际对数
+        int* h_pairList_debug = new int[checkPairs * 2];
+        double* h_rSqdPair_debug = new double[checkPairs];
+        
+        cout << "Checking first " << checkPairs << " pairs' rSqd:" << endl;
+        CUDA_CHECK_ERROR(cudaMemcpy(h_pairList_debug, d_pairList, checkPairs * 2 * sizeof(int), cudaMemcpyDeviceToHost));
+        CUDA_CHECK_ERROR(cudaMemcpy(h_rSqdPair_debug, d_rSqdPair, checkPairs * sizeof(double), cudaMemcpyDeviceToHost));
+
+        cout.precision(6); // 设置输出精度
+        for(int p=0; p<checkPairs; ++p) {
+            cout << "  Pair (" << h_pairList_debug[p*2] << ", " << h_pairList_debug[p*2+1] << "): rSqd = " << scientific << h_rSqdPair_debug[p] << fixed << endl;
+        }
+        delete[] h_pairList_debug;
+        delete[] h_rSqdPair_debug;
+
+        // 计算初始加速度 (CUDA 版本)
+        cout << "Computing initial accelerations (GPU)..." << endl;
+        // 需要先置零加速度
+        int blockSize = 256;
+        int numBlocks = (N + blockSize - 1) / blockSize;
+        zeroAccelerationsKernel<<<numBlocks, blockSize>>>(d_a, N);
+        CUDA_CHECK_ERROR(cudaGetLastError());
+        CUDA_CHECK_ERROR(cudaDeviceSynchronize());
+
+        // 现在计算加速度
+        int numBlocksPairs = (nPairs + blockSize - 1) / blockSize;
+        computeAccelerationsKernel<<<numBlocksPairs, blockSize>>>(d_r, d_a, d_pairList, d_drPair, d_rSqdPair, nPairs, rCutOff, N);
+        CUDA_CHECK_ERROR(cudaGetLastError());
+        CUDA_CHECK_ERROR(cudaDeviceSynchronize());
+
+        // 检查前几个粒子的加速度
+        int checkParticles = min(N, 5); // 检查前5个粒子
+        double* h_a_debug = new double[checkParticles * 3];
+        cout << "Checking initial acceleration of first " << checkParticles << " particles:" << endl;
+        CUDA_CHECK_ERROR(cudaMemcpy(h_a_debug, d_a, checkParticles * 3 * sizeof(double), cudaMemcpyDeviceToHost));
+
+        for (int i=0; i<checkParticles; ++i) {
+            cout << "  Particle " << i << ": a = (" << scientific << h_a_debug[i*3+0] << ", " << h_a_debug[i*3+1] << ", " << h_a_debug[i*3+2] << ")" << fixed << endl;
+        }
+        delete[] h_a_debug;
+    }
+
+    cout << "--- End Debugging Initial Frame ---" << endl;
+
     
     double dt = 0.01;
     ofstream file("T3_CUDA.data");
@@ -546,9 +677,6 @@ int main() {
 
         // 主物理运算，包含三个设备端函数
         velocityVerlet(dt);
-
-        // 在文本文件中写入温度
-        file << instantaneousTemperature() << '\n';
         
         if (i % 200 == 0)
             rescaleVelocities();
@@ -557,6 +685,9 @@ int main() {
 			updatePairList();// 这是一个O（n^2)操作，应当放入CUDA当中，但是还没做
             updatePairSeparations();
         }
+
+        // 在文本文件中写入温度与近邻表大小
+        file << instantaneousTemperature() << ' ' << nPairs << '\n';
     }
     
     file.close();
@@ -565,4 +696,4 @@ int main() {
     freeMemory();
     
     return 0;
-} 
+}

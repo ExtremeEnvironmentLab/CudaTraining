@@ -1,5 +1,9 @@
 ﻿/*
    使用Verlet和动态近邻表方法计算液态氩的分子动力学
+
+   编译运行请使用如下指令
+   g++ ConsoleApplicationMD3.cpp -o MD3_CPU.exe
+   ./MD3_CPU.exe
  */
 
 #include <cmath>
@@ -175,32 +179,6 @@ void velocityVerlet(double dt) {
             v[i][k] += 0.5 * a[i][k] * dt;
 }
 
-//主函数与主循环
-int main() {
-    initialize();
-    updatePairList();
-    updatePairSeparations();
-    computeAccelerations();
-    double dt = 0.01;
-    ofstream file("T3.data");
-    for (int i = 0; i < 1000; i++) {
-        //主物理运算Verlet
-        velocityVerlet(dt);
-        file << instantaneousTemperature() << '\n';
-        if (i % 200 == 0)
-            rescaleVelocities();
-        if (i % updateInterval == 0) {
-
-            //每过特定步数更新一次近邻表，默认是10步
-            updatePairList();
-            //更新近邻表是本程序时间复杂度最高的操作，达到O(N²)
-
-            updatePairSeparations();
-        }
-    }
-    file.close();
-    return(0);
-}
 
 //位置初始化函数
 void initPositions() {
@@ -295,4 +273,35 @@ double instantaneousTemperature() {
         for (int k = 0; k < 3; k++)
             sum += v[i][k] * v[i][k];
     return sum / (3 * (N - 1));
+}
+
+//主函数与主循环
+int main() {
+    initialize();
+    updatePairList();
+    updatePairSeparations();
+    computeAccelerations();
+    double dt = 0.01;
+    ofstream file("T3.data");
+    for (int i = 0; i < 1000; i++) {
+        //主物理运算Verlet
+        velocityVerlet(dt);
+        
+        if (i % 200 == 0)
+            rescaleVelocities();
+        if (i % updateInterval == 0) {
+
+            //每过特定步数更新一次近邻表，默认是10步
+            updatePairList();
+            //更新近邻表是本程序时间复杂度最高的操作，达到O(N²)
+
+            updatePairSeparations();
+
+        }
+
+        // 在文本文件中写入温度与近邻表大小
+        file << instantaneousTemperature() << ' ' << nPairs << '\n';
+    }
+    file.close();
+    return(0);
 }
